@@ -352,6 +352,7 @@ export function getPuzzleQuestion(puzzle: Puzzle | null, language: LanguageCode)
 export function getPokemonArtworkUrl(pokemonId: number | string | undefined): string {
   const id = Number(pokemonId);
   if (!id || Number.isNaN(id)) return '/assets/img/pikachu.png';
+  // Official artwork PNG with yellow glow
   return `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${id}.png`;
 }
 
