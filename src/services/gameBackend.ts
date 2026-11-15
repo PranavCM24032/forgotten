@@ -146,6 +146,7 @@ interface PendingSyncItem {
 
 const MAX_OUTBOX_ITEMS = 500;
 let flushInFlight = false;
+let batchFlushTimer: number | undefined;
 
 function readPendingSyncQueue(): PendingSyncItem[] {
   try {
@@ -218,6 +219,18 @@ async function postWithOutbox(
   if (!hasAppsScriptBackend()) return;
   enqueueSyncEvent(payload);
   const eventId = String(payload.eventId || '');
+
+  // Registration binds the team/session on the server, so send it immediately.
+  // Gameplay events stay in the durable outbox briefly and share one batch request.
+  if (String(payload.action || '').trim().toUpperCase() !== 'REGISTRATION') {
+    if (batchFlushTimer !== undefined) window.clearTimeout(batchFlushTimer);
+    batchFlushTimer = window.setTimeout(() => {
+      batchFlushTimer = undefined;
+      void flushPendingSyncQueue();
+    }, 4000);
+    return;
+  }
+
   try {
     await callAppsScriptPost(payload, timeoutMs);
     if (eventId) removeSyncEvents(new Set([eventId]));
@@ -231,6 +244,10 @@ async function postWithOutbox(
 }
 
 export async function flushPendingSyncQueue(): Promise<void> {
+  if (batchFlushTimer !== undefined) {
+    window.clearTimeout(batchFlushTimer);
+    batchFlushTimer = undefined;
+  }
   if (!hasAppsScriptBackend() || flushInFlight) return;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
