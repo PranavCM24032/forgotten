@@ -33,7 +33,7 @@
  *   - TEAM_RATE_LIMIT       : Max requests per team per window (default: 90)
  *   - TEAM_RATE_WINDOW_SECS : Rate-limit window in seconds (default: 60)
  *   - CACHE_TTL_SECS        : Cache & event dedupe TTL seconds (default: 21600)
- *   - ADMIN_PASSWORD        : Secret matching admin.json (default: 123)
+ *   - ADMIN_PASSWORD        : Secret matching admin.json (required for admin APIs)
  *   - MAX_PUZZLE_POINTS     : Upper bound per puzzle solve (default: 500)
  *   - SPREADSHEET_ID        : Auto-populated from your Google Sheet ID
  * ============================================================================
@@ -54,7 +54,7 @@ var PROP_KEYS = {
 };
 
 var DEFAULT_PROPERTIES = {
-  SPREADSHEET_ID: '1XtDTCSSgMua_BmxAUhnUG7RZ9jfO3fxAL-vVoxmAY-k',
+  SPREADSHEET_ID: '',
   SHEET_REG: 'Registration',
   SHEET_L1: 'L1',
   SHEET_L2: 'L2',
@@ -63,7 +63,7 @@ var DEFAULT_PROPERTIES = {
   TEAM_RATE_LIMIT: '90',
   TEAM_RATE_WINDOW_SECS: '60',
   CACHE_TTL_SECS: '21600',
-  ADMIN_PASSWORD: '123',
+  ADMIN_PASSWORD: '',
   MAX_PUZZLE_POINTS: '500',
 };
 
@@ -254,10 +254,8 @@ function assertAdmin_(cfg, candidateKey) {
     throw new Error('Unauthorized: Missing admin access key.');
   }
 
-  // Check against configured admin password AND organizer fallback ('123')
-  var isMatch =
-    constantTimeEquals_(key, cfg.adminPassword) ||
-    constantTimeEquals_(key, '123');
+  // Admin access must use the explicitly configured secret. There is no fallback password.
+  var isMatch = Boolean(cfg.adminPassword) && constantTimeEquals_(key, cfg.adminPassword);
 
   if (isMatch) {
     // Valid password always succeeds and clears failure counter
@@ -349,6 +347,16 @@ function getTeamIdentity_(data) {
   if (!tid && !teamName) return null;
   if (teamName === 'Unknown' || teamName === 'NO TEAM') return null;
   return { tid: tid, teamName: teamName };
+}
+
+function teamIdentityMatches_(row, tidIndex, teamIndex, tid, teamName) {
+  if (!row) return false;
+  var expectedTid = cellText_(tid).toUpperCase();
+  var expectedName = cellText_(teamName).toUpperCase();
+  return (
+    (!expectedTid || cellText_(row[tidIndex]).toUpperCase() === expectedTid) &&
+    (!expectedName || cellText_(row[teamIndex]).toUpperCase() === expectedName)
+  );
 }
 
 function teamRowMatches(row, tidIndex, teamIndex, tid, teamName) {
@@ -565,7 +573,19 @@ function getRegisteredInfo_(ss, tid, teamName, cfg) {
   var cached = cache.get(rKey);
   if (cached) {
     try {
-      return JSON.parse(cached);
+      var cachedInfo = JSON.parse(cached);
+      var cachedSheet = ss.getSheetByName(cfg.sheets.reg);
+      if (
+        cachedSheet &&
+        cachedInfo.row > 1 &&
+        cachedInfo.row <= cachedSheet.getLastRow()
+      ) {
+        var cachedRow = cachedSheet
+          .getRange(cachedInfo.row, 1, 1, REG_HEADERS.length)
+          .getValues()[0];
+        if (teamIdentityMatches_(cachedRow, 1, 2, tid, teamName)) return cachedInfo;
+        if (teamRowMatches(cachedRow, 1, 2, tid, teamName)) return { invalid: true };
+      }
     } catch (e) {
       // fall through
     }
@@ -578,6 +598,7 @@ function getRegisteredInfo_(ss, tid, teamName, cfg) {
     .getValues();
   for (var i = 1; i < rows.length; i++) {
     if (teamRowMatches(rows[i], 1, 2, tid, teamName)) {
+      if (!teamIdentityMatches_(rows[i], 1, 2, tid, teamName)) return { invalid: true };
       var info = { row: i + 1, sessionId: cellText_(rows[i][6]) };
       try {
         cache.put(rKey, JSON.stringify(info), cfg.cacheTtlSecs);
@@ -932,6 +953,10 @@ function doPost(e) {
       return jsonResponse_({ status: 'error', message: 'login required' });
     }
 
+    if (!String(data.sessionId || '').trim()) {
+      return jsonResponse_({ status: 'error', message: 'sessionId is required' });
+    }
+
     var rateKey = writeSession.tid || writeSession.teamName || '';
     if (!checkTeamRate(rateKey, cfg)) {
       return jsonResponse_({
@@ -944,6 +969,23 @@ function doPost(e) {
     var mutated = false;
 
     if (action === 'SESSION_BATCH' && Array.isArray(data.events)) {
+      if (data.events.length < 1 || data.events.length > 25) {
+        return jsonResponse_({ status: 'error', message: 'Batch must contain 1 to 25 events' });
+      }
+      var seenBatchIds = {};
+      for (var v = 0; v < data.events.length; v++) {
+        var candidateEvent = data.events[v];
+        var candidateId = String(candidateEvent && candidateEvent.eventId || '').trim();
+        if (
+          !candidateEvent ||
+          !candidateId ||
+          seenBatchIds[candidateId] ||
+          !String(candidateEvent.sessionId || data.sessionId || '').trim()
+        ) {
+          return jsonResponse_({ status: 'error', message: 'Every batch event needs a unique eventId' });
+        }
+        seenBatchIds[candidateId] = true;
+      }
       // Process REGISTRATION events first so session binding succeeds cleanly
       var orderedEvents = [];
       for (var r = 0; r < data.events.length; r++) {
@@ -959,16 +1001,33 @@ function doPost(e) {
         }
       }
 
+      var acceptedEventIds = [];
+      var rejectedEvents = [];
       for (var k = 0; k < orderedEvents.length; k++) {
         var ev = orderedEvents[k];
         ev.tid = writeSession.tid || sanitizeId_(String(ev.tid || '').toUpperCase(), 32);
         ev.teamName = writeSession.teamName || String(ev.teamName || '').trim().substring(0, 60);
         if (!ev.sessionId && data.sessionId) ev.sessionId = data.sessionId;
-        if (processEventFast_(ss, ev, cfg)) {
+        var outcome = processEventFast_(ss, ev, cfg);
+        var eventId = String(ev.eventId || '').trim();
+        if (outcome === true || isDuplicateEvent(eventId, cfg)) {
+          acceptedEventIds.push(eventId);
+        } else {
+          rejectedEvents.push({
+            eventId: eventId,
+            reason: outcome === 'rejected_auth'
+              ? 'Team session not registered or does not match'
+              : 'Event was invalid or could not be applied',
+          });
+        }
+        if (outcome === true) {
           mutated = true;
         }
       }
     } else {
+      if (action === 'SESSION_BATCH') {
+        return jsonResponse_({ status: 'error', message: 'Batch events are required' });
+      }
       data.tid = writeSession.tid;
       data.teamName = writeSession.teamName;
       var outcome = processEventFast_(ss, data, cfg);
@@ -984,6 +1043,14 @@ function doPost(e) {
     if (mutated) {
       invalidateAdminSnapshotCache_(cfg);
       SpreadsheetApp.flush();
+    }
+    if (action === 'SESSION_BATCH') {
+      return jsonResponse_({
+        status: 'success',
+        epoch: cfg.epoch,
+        acceptedEventIds: acceptedEventIds,
+        rejectedEvents: rejectedEvents,
+      });
     }
     return jsonResponse_({ status: 'success', epoch: cfg.epoch });
   } catch (err) {
@@ -1045,7 +1112,9 @@ function processEventFast_(ss, data, cfg) {
 
   // ── 1. REGISTRATION: Direct O(1) row update/append + session bind ──────────
   if (action === 'REGISTRATION') {
+    if (!incomingSession) return 'rejected_auth';
     var regInfo = getRegisteredInfo_(ss, tid, teamName, cfg);
+    if (regInfo && regInfo.invalid) return 'rejected_auth';
     var levelVal = safeCell(
       String(
         data.level ||
@@ -1059,7 +1128,7 @@ function processEventFast_(ss, data, cfg) {
       var existing = sheet
         .getRange(regInfo.row, 1, 1, REG_HEADERS.length)
         .getValues()[0];
-      if (teamRowMatches(existing, 1, 2, tid, teamName)) {
+      if (teamIdentityMatches_(existing, 1, 2, tid, teamName)) {
         regRowIdx = regInfo.row;
         rowArray = [
           existing[0] || timestamp,
@@ -1094,13 +1163,13 @@ function processEventFast_(ss, data, cfg) {
 
   // ── 2. LEVEL EVENTS: Enforce session binding & O(1) targeted row upsert ──
   var regCheck = getRegisteredInfo_(ss, tid, teamName, cfg);
-  if (!regCheck) {
+  if (!regCheck || regCheck.invalid) {
     // Reject unauthenticated writes from unregistered teams
     return 'rejected_auth';
   }
   if (
-    regCheck.sessionId &&
-    incomingSession &&
+    !incomingSession ||
+    !regCheck.sessionId ||
     regCheck.sessionId !== incomingSession
   ) {
     // Reject stale / hijacked session writes

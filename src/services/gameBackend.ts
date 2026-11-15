@@ -144,6 +144,11 @@ interface PendingSyncItem {
   createdAt: number;
 }
 
+interface FailedSyncItem extends PendingSyncItem {
+  failedAt: number;
+  reason: string;
+}
+
 const MAX_OUTBOX_ITEMS = 500;
 let flushInFlight = false;
 let batchFlushTimer: number | undefined;
@@ -212,6 +217,23 @@ function removeSyncEvents(eventIds: Set<string>): void {
   writePendingSyncQueue(remaining);
 }
 
+function quarantineSyncEvents(items: PendingSyncItem[], reason: string): boolean {
+  if (items.length === 0) return true;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.failedSyncQueue);
+    const previous = raw ? (JSON.parse(raw) as FailedSyncItem[]) : [];
+    const next = [
+      ...previous,
+      ...items.map((item) => ({ ...item, failedAt: Date.now(), reason })),
+    ].slice(-100);
+    localStorage.setItem(STORAGE_KEYS.failedSyncQueue, JSON.stringify(next));
+    return true;
+  } catch {
+    console.error('[Sheets] Could not persist rejected telemetry events.');
+    return false;
+  }
+}
+
 async function postWithOutbox(
   payload: Record<string, unknown>,
   timeoutMs = 8000
@@ -278,7 +300,7 @@ export async function flushPendingSyncQueue(): Promise<void> {
         const chunk = ordered.slice(i, i + BATCH_SIZE);
         const head = chunk[0];
         try {
-          await callAppsScriptPost(
+          const response = await callAppsScriptPost(
             {
               action: 'SESSION_BATCH',
               tid: head.tid,
@@ -288,7 +310,51 @@ export async function flushPendingSyncQueue(): Promise<void> {
             },
             15000
           );
-          removeSyncEvents(new Set(chunk.map((c) => c.eventId)));
+          const acceptedIds = Array.isArray(response.acceptedEventIds)
+            ? response.acceptedEventIds.map(String)
+            : [];
+          const rejected = Array.isArray(response.rejectedEvents)
+            ? response.rejectedEvents.filter(
+                (item): item is Record<string, unknown> => Boolean(item && typeof item === 'object')
+              )
+            : [];
+          const rejectedIds = rejected.map((item) => String(item.eventId || '')).filter(Boolean);
+          const resolvedIds = new Set([...acceptedIds, ...rejectedIds]);
+
+          // An older deployment may answer success without per-event acknowledgements.
+          // Keep the outbox until the Apps Script endpoint has been upgraded.
+          if (resolvedIds.size === 0 && chunk.length > 0) {
+            throw new Error('Batch response did not acknowledge individual events.');
+          }
+
+          const chunkIds = new Set(chunk.map((item) => item.eventId));
+          const unexpectedIds = [...resolvedIds].filter((id) => !chunkIds.has(id));
+          if (unexpectedIds.length > 0) {
+            throw new Error('Batch response acknowledged unknown event IDs.');
+          }
+
+          const acceptedSet = new Set(acceptedIds);
+          rejected.forEach((item) => {
+            const eventId = String(item.eventId || '');
+            const failed = chunk.find((entry) => entry.eventId === eventId);
+            if (failed) {
+              if (
+                quarantineSyncEvents(
+                  [failed],
+                  String(item.reason || 'Rejected by Apps Script')
+                )
+              ) {
+                acceptedSet.add(eventId);
+              }
+            }
+          });
+          removeSyncEvents(acceptedSet);
+          const unresolved = chunk.filter((item) => !acceptedSet.has(item.eventId));
+          if (unresolved.length > 0) {
+            // Partial acknowledgements are safe: accepted events are removed, and
+            // unresolved events remain in the outbox for a later retry.
+            return;
+          }
         } catch {
           // Stop batching on transient error; items stay safely in outbox
           return;

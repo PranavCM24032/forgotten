@@ -42,7 +42,7 @@ The app starts on `http://localhost:3000`.
    - `SHEET_REG` (e.g. `Registration`)
    - `SHEET_L1` (e.g. `L1`), `SHEET_L2` (e.g. `L2`), `SHEET_L3` (e.g. `L3`)
    - `GAME_EPOCH` (`1`), `TEAM_RATE_LIMIT` (`90`), `TEAM_RATE_WINDOW_SECS` (`60`), `CACHE_TTL_SECS` (`21600`)
-   - `ADMIN_PASSWORD` (must match your organizer password in `public/data/admin.json`)
+   - `ADMIN_PASSWORD` (required; must match your organizer password in `public/data/admin.json`; there is no default password)
    - `MAX_PUZZLE_POINTS` (e.g. `500` — server-side upper bound per solve)
    - `SPREADSHEET_ID` (required only if Apps Script is standalone; optional if opened from Extensions → Apps Script)
 3. Run `initializeSpreadsheet` once, then **Deploy → Web app** (`Execute as: Me`, `Who has access: Anyone`).
