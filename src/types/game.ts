@@ -176,7 +176,6 @@ export const STORAGE_KEYS = {
   localLogs: 'pykachuLocalTelemetryLogs_v1',
   localTeamProgress: 'pykachuLocalTeamProgress_v1',
   pendingSyncQueue: 'pykachuPendingSyncQueue_v1',
-  failedSyncQueue: 'pykachuFailedSyncQueue_v1',
   adminSessionKey: 'pykachuAdminSessionKey',
 } as const;
 

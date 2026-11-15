@@ -856,16 +856,12 @@ const PokedexGameApp: React.FC = () => {
       const prevRemembered = getRememberedTeamInfo();
       const prevKey = prevRemembered ? prevRemembered.tid || prevRemembered.teamName : '';
       const isDifferentTeam = !prevKey || prevKey !== resolvedTid;
-      const rememberedSessionId = String(prevRemembered?.sessionId || '').trim();
-      let nextSessionId = !isDifferentTeam && rememberedSessionId
-        ? rememberedSessionId
-        : sessionId;
+
+      let nextSessionId = sessionId;
       if (isDifferentTeam) {
         nextSessionId = generateSessionId();
         setSessionId(nextSessionId);
         clearGameStateLocal();
-      } else if (rememberedSessionId && nextSessionId !== sessionId) {
-        setSessionId(nextSessionId);
       }
 
       const { epoch: serverEpoch, teamProgress } = await syncTeamRegistrationToDb({
@@ -894,7 +890,6 @@ const PokedexGameApp: React.FC = () => {
         tid: resolvedTid,
         mission: formMissionLevel,
         language: formLanguage,
-        sessionId: nextSessionId,
       });
       saveTeamScoreStateLocal(resolvedTid, {
         score: teamProgress.score,

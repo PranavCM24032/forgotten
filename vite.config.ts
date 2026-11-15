@@ -20,7 +20,7 @@ function resolveSiteOrigin(): string {
   if (cleaned.startsWith('https://ais-dev-')) {
     return cleaned.replace('https://ais-dev-', 'https://ais-pre-');
   }
-  return cleaned || 'https://pykachugov34.vercel.app';
+  return cleaned || 'https://pykachugo.vercel.app';
 }
 
 function ogMetaOriginPlugin(): Plugin {

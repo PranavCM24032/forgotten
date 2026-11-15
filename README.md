@@ -42,16 +42,38 @@ The app starts on `http://localhost:3000`.
    - `SHEET_REG` (e.g. `Registration`)
    - `SHEET_L1` (e.g. `L1`), `SHEET_L2` (e.g. `L2`), `SHEET_L3` (e.g. `L3`)
    - `GAME_EPOCH` (`1`), `TEAM_RATE_LIMIT` (`90`), `TEAM_RATE_WINDOW_SECS` (`60`), `CACHE_TTL_SECS` (`21600`)
-   - `ADMIN_PASSWORD` (required; must match your organizer password in `public/data/admin.json`; there is no default password)
+   - `ADMIN_PASSWORD` (must match your organizer password in `public/data/admin.json`)
    - `MAX_PUZZLE_POINTS` (e.g. `500` — server-side upper bound per solve)
    - `SPREADSHEET_ID` (required only if Apps Script is standalone; optional if opened from Extensions → Apps Script)
 3. Run `initializeSpreadsheet` once, then **Deploy → Web app** (`Execute as: Me`, `Who has access: Anyone`).
 4. Copy `.env.example` to `.env` and set `VITE_APPS_SCRIPT_URL="<your-web-app-/exec-url>"`.
-5. After changing `apps-script/Code.gs`, use **Deploy → Manage deployments → Edit** on the existing web app and select **New version**. Keep the same deployment URL; the app now requires backend protocol version 2 (health version `3.5.0`).
-6. For Vercel, add `VITE_APPS_SCRIPT_URL` under **Project Settings → Environment Variables** for each environment you deploy, then redeploy the frontend. A local `.env` file does not configure Vercel builds.
 
 ### 3. Build & Verify
 ```bash
 npm run lint   # TypeScript check (tsc --noEmit)
 npm run build  # Production bundle in ./dist
 ```
+
+---
+
+## Deploy to GitHub & Vercel
+
+1. **Pre-Push Security Check**:
+   - Change the default organizer credentials in `public/data/admin.json` and set the matching `ADMIN_PASSWORD` in Apps Script **Script Properties**.
+   - Confirm `.env` is untracked (`.gitignore` excludes `.env*` while keeping `.env.example`).
+2. **Push to GitHub**:
+   ```bash
+   git init
+   git add .
+   git commit -m "feat: Pykachu Go v3.4"
+   git branch -M main
+   git remote add origin https://github.com/<your-username>/<your-repo>.git
+   git push -u origin main
+   ```
+3. **Import into Vercel**:
+   - Framework Preset: **Vite** (configured automatically via `vercel.json`)
+   - Build Command: `npm run build` • Output Directory: `dist`
+   - Environment Variables (Project Settings → Environment Variables):
+     - `VITE_APPS_SCRIPT_URL`: Your deployed Google Apps Script `/exec` URL *(optional; runs locally if unset)*
+     - `VITE_SITE_URL`: Custom canonical HTTPS domain for OG link previews *(optional; Vercel sets `VERCEL_PROJECT_PRODUCTION_URL` / `VERCEL_URL` automatically)*
+

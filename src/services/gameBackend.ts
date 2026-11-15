@@ -23,16 +23,11 @@ export function hasAppsScriptBackend(): boolean {
 }
 
 function getAppsScriptUrl(): string {
-  let url = String(import.meta.env.VITE_APPS_SCRIPT_URL || '').trim();
+  const url = String(import.meta.env.VITE_APPS_SCRIPT_URL || '').trim();
   if (!url) {
     throw new Error(
       'Apps Script URL not configured (operating in fast local JSON mode).'
     );
-  }
-  // Strip Google Workspace tenant prefix (/a/macros/<domain>/s/ -> /macros/s/)
-  // Institutional /a/ paths fail CORS and force Google login redirects.
-  if (url.includes('/a/macros/')) {
-    url = url.replace(/\/a\/macros\/[^/]+\/s\//, '/macros/s/');
   }
   return url;
 }
@@ -68,7 +63,7 @@ function unwrapAppsScriptPayload(raw: unknown, label: string): Record<string, un
 async function callAppsScriptGet(
   action: string,
   params: Record<string, string | number | boolean | undefined> = {},
-  timeoutMs = 12000
+  timeoutMs = 8000
 ): Promise<Record<string, unknown> | unknown[]> {
   const baseUrl = getAppsScriptUrl();
   const url = new URL(baseUrl);
@@ -101,7 +96,7 @@ async function callAppsScriptGet(
 
 async function callAppsScriptPost(
   body: Record<string, unknown>,
-  timeoutMs = 12000
+  timeoutMs = 8000
 ): Promise<Record<string, unknown>> {
   const baseUrl = getAppsScriptUrl();
   const action = String(body.action || 'UNKNOWN');
@@ -144,14 +139,8 @@ interface PendingSyncItem {
   createdAt: number;
 }
 
-interface FailedSyncItem extends PendingSyncItem {
-  failedAt: number;
-  reason: string;
-}
-
 const MAX_OUTBOX_ITEMS = 500;
 let flushInFlight = false;
-let batchFlushTimer: number | undefined;
 
 function readPendingSyncQueue(): PendingSyncItem[] {
   try {
@@ -217,23 +206,6 @@ function removeSyncEvents(eventIds: Set<string>): void {
   writePendingSyncQueue(remaining);
 }
 
-function quarantineSyncEvents(items: PendingSyncItem[], reason: string): boolean {
-  if (items.length === 0) return true;
-  try {
-    const raw = localStorage.getItem(STORAGE_KEYS.failedSyncQueue);
-    const previous = raw ? (JSON.parse(raw) as FailedSyncItem[]) : [];
-    const next = [
-      ...previous,
-      ...items.map((item) => ({ ...item, failedAt: Date.now(), reason })),
-    ].slice(-100);
-    localStorage.setItem(STORAGE_KEYS.failedSyncQueue, JSON.stringify(next));
-    return true;
-  } catch {
-    console.error('[Sheets] Could not persist rejected telemetry events.');
-    return false;
-  }
-}
-
 async function postWithOutbox(
   payload: Record<string, unknown>,
   timeoutMs = 8000
@@ -241,25 +213,8 @@ async function postWithOutbox(
   if (!hasAppsScriptBackend()) return;
   enqueueSyncEvent(payload);
   const eventId = String(payload.eventId || '');
-
-  // Registration binds the team/session on the server, so send it immediately.
-  // Gameplay events stay in the durable outbox briefly and share one batch request.
-  if (String(payload.action || '').trim().toUpperCase() !== 'REGISTRATION') {
-    if (batchFlushTimer !== undefined) window.clearTimeout(batchFlushTimer);
-    batchFlushTimer = window.setTimeout(() => {
-      batchFlushTimer = undefined;
-      void flushPendingSyncQueue();
-    }, 4000);
-    return;
-  }
-
   try {
-    const response = await callAppsScriptPost(payload, timeoutMs);
-    if (Number(response.protocolVersion || 0) < 2) {
-      throw new Error(
-        'Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
-      );
-    }
+    await callAppsScriptPost(payload, timeoutMs);
     if (eventId) removeSyncEvents(new Set([eventId]));
     // Trigger background drain if older retries are waiting
     if (readPendingSyncQueue().length > 0) {
@@ -271,10 +226,6 @@ async function postWithOutbox(
 }
 
 export async function flushPendingSyncQueue(): Promise<void> {
-  if (batchFlushTimer !== undefined) {
-    window.clearTimeout(batchFlushTimer);
-    batchFlushTimer = undefined;
-  }
   if (!hasAppsScriptBackend() || flushInFlight) return;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
@@ -305,7 +256,7 @@ export async function flushPendingSyncQueue(): Promise<void> {
         const chunk = ordered.slice(i, i + BATCH_SIZE);
         const head = chunk[0];
         try {
-          const response = await callAppsScriptPost(
+          await callAppsScriptPost(
             {
               action: 'SESSION_BATCH',
               tid: head.tid,
@@ -315,59 +266,9 @@ export async function flushPendingSyncQueue(): Promise<void> {
             },
             15000
           );
-          if (Number(response.protocolVersion || 0) < 2) {
-            throw new Error(
-              'Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
-            );
-          }
-          const acceptedIds = Array.isArray(response.acceptedEventIds)
-            ? response.acceptedEventIds.map(String)
-            : [];
-          const rejected = Array.isArray(response.rejectedEvents)
-            ? response.rejectedEvents.filter(
-                (item): item is Record<string, unknown> => Boolean(item && typeof item === 'object')
-              )
-            : [];
-          const rejectedIds = rejected.map((item) => String(item.eventId || '')).filter(Boolean);
-          const resolvedIds = new Set([...acceptedIds, ...rejectedIds]);
-
-          // An older deployment may answer success without per-event acknowledgements.
-          // Keep the outbox until the Apps Script endpoint has been upgraded.
-          if (resolvedIds.size === 0 && chunk.length > 0) {
-            throw new Error('Batch response did not acknowledge individual events.');
-          }
-
-          const chunkIds = new Set(chunk.map((item) => item.eventId));
-          const unexpectedIds = [...resolvedIds].filter((id) => !chunkIds.has(id));
-          if (unexpectedIds.length > 0) {
-            throw new Error('Batch response acknowledged unknown event IDs.');
-          }
-
-          const acceptedSet = new Set(acceptedIds);
-          rejected.forEach((item) => {
-            const eventId = String(item.eventId || '');
-            const failed = chunk.find((entry) => entry.eventId === eventId);
-            if (failed) {
-              if (
-                quarantineSyncEvents(
-                  [failed],
-                  String(item.reason || 'Rejected by Apps Script')
-                )
-              ) {
-                acceptedSet.add(eventId);
-              }
-            }
-          });
-          removeSyncEvents(acceptedSet);
-          const unresolved = chunk.filter((item) => !acceptedSet.has(item.eventId));
-          if (unresolved.length > 0) {
-            // Partial acknowledgements are safe: accepted events are removed, and
-            // unresolved events remain in the outbox for a later retry.
-            return;
-          }
-        } catch (err) {
-          // Stop batching on transient error; items stay safely in outbox.
-          console.warn('[Sheets] Batch sync failed; events remain queued:', err);
+          removeSyncEvents(new Set(chunk.map((c) => c.eventId)));
+        } catch {
+          // Stop batching on transient error; items stay safely in outbox
           return;
         }
       }
@@ -792,14 +693,6 @@ export async function fetchGameMeta(): Promise<{
     try {
       const remote = await callAppsScriptGet('GET_EPOCH', {}, 3500);
       const remoteEpoch = Array.isArray(remote) ? 1 : Number(remote?.epoch || 1);
-      const protocolVersion = Array.isArray(remote)
-        ? 0
-        : Number(remote.protocolVersion || 0);
-      if (protocolVersion < 2) {
-        console.error(
-          '[Sheets] Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
-        );
-      }
       return {
         epoch: Math.max(localEpoch, Number.isFinite(remoteEpoch) && remoteEpoch >= 1 ? Math.floor(remoteEpoch) : 1),
         catalogVersion: localOverrides.catalogVersion,
@@ -946,7 +839,6 @@ export interface RememberedTeamInfo {
   tid: string;
   mission: string;
   language: LanguageCode;
-  sessionId?: string;
 }
 
 export interface SavedGameState {
@@ -1503,7 +1395,7 @@ export async function syncTeamRegistrationToDb(params: {
         sessionId: sessionId.trim().slice(0, 64),
         timestamp: nowIso,
       },
-      12000
+      3500
     );
   }
 
@@ -1785,8 +1677,6 @@ export async function fetchAdminLogs(
   nextSinceRow: number;
   fullSnapshot: boolean;
 }> {
-  const localEpoch = Math.max(1, Number(localStorage.getItem(STORAGE_KEYS.gameEpoch) || 1));
-
   if (hasAppsScriptBackend()) {
     try {
       const res = await callAppsScriptGet(
@@ -1794,11 +1684,7 @@ export async function fetchAdminLogs(
         { adminKey: adminKey || undefined },
         20000
       );
-      if (!Array.isArray(res) && Number(res.protocolVersion || 0) < 2) {
-        throw new Error(
-          'Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
-        );
-      }
+      const localEpoch = Math.max(1, Number(localStorage.getItem(STORAGE_KEYS.gameEpoch) || 1));
       const rawRows = Array.isArray(res)
         ? res
         : Array.isArray(res.logs)
@@ -1819,13 +1705,14 @@ export async function fetchAdminLogs(
         fullSnapshot: true,
       };
     } catch (err) {
-      console.warn('[Admin Telemetry] Google Apps Script sync error:', err);
-      // Do not present this browser's local events as if they came from the shared sheet.
-      // Local-only telemetry is returned only when no Apps Script backend is configured.
-      throw err;
+      if (err instanceof Error && /unauthorized/i.test(err.message)) {
+        throw err;
+      }
+      // fall back cleanly to local telemetry logs on network / offline issues
     }
   }
 
+  const localEpoch = Math.max(1, Number(localStorage.getItem(STORAGE_KEYS.gameEpoch) || 1));
   const allLogs = readLocalTelemetryLogs();
   return {
     epoch: localEpoch,
@@ -1840,20 +1727,18 @@ export async function adminResetAllData(adminKey: string): Promise<number> {
   let nextEpoch = Math.min(1000000, curEpoch + 1);
 
   if (hasAppsScriptBackend()) {
-    const res = await callAppsScriptPost({
-      action: 'RESET_ALL',
-      adminKey: adminKey || undefined,
-    });
-    if (Number(res.protocolVersion || 0) < 2) {
-      throw new Error(
-        'Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
-      );
+    try {
+      const res = await callAppsScriptPost({
+        action: 'RESET_ALL',
+        adminKey: adminKey || undefined,
+      });
+      const remoteEpoch = Number(res?.epoch || 0);
+      if (Number.isFinite(remoteEpoch) && remoteEpoch > 0) {
+        nextEpoch = Math.max(nextEpoch, Math.floor(remoteEpoch));
+      }
+    } catch {
+      // keep local epoch bump even if remote offline
     }
-    const remoteEpoch = Number(res?.epoch || 0);
-    if (!Number.isFinite(remoteEpoch) || remoteEpoch < 1) {
-      throw new Error('Apps Script reset did not return a valid epoch.');
-    }
-    nextEpoch = Math.max(nextEpoch, Math.floor(remoteEpoch));
   }
 
   wipeAllLocalGameStorage(nextEpoch);

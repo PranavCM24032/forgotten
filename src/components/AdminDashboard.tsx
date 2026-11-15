@@ -239,18 +239,9 @@ export const AdminDashboard: React.FC = () => {
         if (cancelled) return;
         console.warn('Admin Sheet polling error:', err);
         const isAuthError = err instanceof Error && /unauthorized/i.test(err.message);
-        const isVersionError = err instanceof Error && /outdated|protocol/i.test(err.message);
         setHasLiveData(false);
-        setLastUpdatedText(
-          isAuthError
-            ? 'CHECK ADMIN_PASSWORD PROP'
-            : isVersionError
-              ? 'DEPLOY APPS SCRIPT v3.5.0'
-              : 'RETRYING...'
-        );
-        setSystemStatusText(
-          isAuthError ? 'AUTH MISMATCH' : isVersionError ? 'OUTDATED BACKEND' : 'OFFLINE'
-        );
+        setLastUpdatedText(isAuthError ? 'CHECK ADMIN_PASSWORD PROP' : 'RETRYING...');
+        setSystemStatusText(isAuthError ? 'AUTH MISMATCH' : 'OFFLINE');
         setSystemStatusClass('text-pink-500');
       } finally {
         pollInFlightRef.current = false;
@@ -741,9 +732,8 @@ export const AdminDashboard: React.FC = () => {
           setSystemStatusClass(autoRefresh ? 'text-green-400' : 'text-orange-400');
         })
         .catch(() => {
-          setSystemStatusText('OFFLINE');
-          setSystemStatusClass('text-pink-500');
-          setLastUpdatedText('ADMIN DATA FETCH FAILED');
+          setSystemStatusText(autoRefresh ? 'ONLINE' : 'SYNC PAUSED');
+          setSystemStatusClass(autoRefresh ? 'text-green-400' : 'text-orange-400');
         });
     }, 600);
   };

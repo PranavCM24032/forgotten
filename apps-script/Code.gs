@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * PYKACHU GO v3.5 — HARDENED GOOGLE APPS SCRIPT TELEMETRY BACKEND
+ * PYKACHU GO v3.4 — HARDENED GOOGLE APPS SCRIPT TELEMETRY BACKEND
  * ============================================================================
  * Architecture:
  *   - Local JSON (`public/data/*.json`) serves static catalog & admin login.
@@ -8,34 +8,26 @@
  *     for 100+ concurrent teams × 40+ puzzles using O(1) single-row reads/writes,
  *     ScriptCache row indexing, session binding, and chunked admin snapshots.
  *
- * ONE-CLICK SETUP:
- *   1. Create a blank Google Sheet in Google Drive.
- *   2. Click Extensions → Apps Script.
- *   3. Replace all code in Code.gs with this file and save (Ctrl+S).
- *   4. In the function dropdown at the top, select `setupScriptProperties` and click "Run".
- *      (Approve the standard Google authorization prompt).
- *      All 4 tabs (Registration, L1, L2, L3) will be created and formatted instantly!
- *   5. Click Deploy → New deployment:
- *      - Select type: Web app (gear icon)
- *      - Description: Pykachu Go v3.5 Telemetry
- *      - Execute as: Me (<your-email>)
- *      - Who has access: Anyone
- *   6. Click Deploy, copy the Web App URL (ends with /exec), and paste into your project's .env:
- *      VITE_APPS_SCRIPT_URL="https://script.google.com/macros/s/.../exec"
+ * ZERO HARDCODED VARIABLES:
+ * Configure EVERY key below in Apps Script → Project Settings → Script Properties:
+ *   - SHEET_REG             : Tab name for registrations          (e.g. Registration)
+ *   - SHEET_L1              : Tab name for Level 1 telemetry      (e.g. L1)
+ *   - SHEET_L2              : Tab name for Level 2 telemetry      (e.g. L2)
+ *   - SHEET_L3              : Tab name for Level 3 telemetry      (e.g. L3)
+ *   - GAME_EPOCH            : Monotonic reset counter             (e.g. 1)
+ *   - TEAM_RATE_LIMIT       : Max requests per team per window    (e.g. 90)
+ *   - TEAM_RATE_WINDOW_SECS : Rate-limit window in seconds        (e.g. 60)
+ *   - CACHE_TTL_SECS        : Cache & event dedupe TTL seconds    (e.g. 21600)
+ *   - ADMIN_PASSWORD        : Secret protecting ADMIN_GET_DATA & RESET_ALL
+ *   - MAX_PUZZLE_POINTS     : Upper bound per puzzle solve        (e.g. 500)
+ *   - SPREADSHEET_ID        : Optional if container-bound; required if standalone
  *
- * CUSTOM CONFIGURATION (Optional):
- * If you ever need to change settings, go to Project Settings → Script Properties:
- *   - SHEET_REG             : Tab name for registrations (default: Registration)
- *   - SHEET_L1              : Tab name for Level 1 telemetry (default: L1)
- *   - SHEET_L2              : Tab name for Level 2 telemetry (default: L2)
- *   - SHEET_L3              : Tab name for Level 3 telemetry (default: L3)
- *   - GAME_EPOCH            : Monotonic reset counter (default: 1)
- *   - TEAM_RATE_LIMIT       : Max requests per team per window (default: 90)
- *   - TEAM_RATE_WINDOW_SECS : Rate-limit window in seconds (default: 60)
- *   - CACHE_TTL_SECS        : Cache & event dedupe TTL seconds (default: 21600)
- *   - ADMIN_PASSWORD        : Secret matching admin.json (required for admin APIs)
- *   - MAX_PUZZLE_POINTS     : Upper bound per puzzle solve (default: 500)
- *   - SPREADSHEET_ID        : Auto-populated from your Google Sheet ID
+ * ONE-TIME SETUP:
+ *   1. Open Extensions → Apps Script in your Google Sheet.
+ *   2. Paste this file into Code.gs.
+ *   3. Project Settings → Script Properties → add all required keys above.
+ *   4. Run `initializeSpreadsheet` once to create/format all 4 tabs.
+ *   5. Deploy → New deployment → Web app (`Execute as: Me`, `Who has access: Anyone`).
  * ============================================================================
  */
 
@@ -52,23 +44,6 @@ var PROP_KEYS = {
   ADMIN_PASSWORD: 'ADMIN_PASSWORD',
   MAX_PUZZLE_POINTS: 'MAX_PUZZLE_POINTS',
 };
-
-var DEFAULT_PROPERTIES = {
-  SPREADSHEET_ID: '',
-  SHEET_REG: 'Registration',
-  SHEET_L1: 'L1',
-  SHEET_L2: 'L2',
-  SHEET_L3: 'L3',
-  GAME_EPOCH: '1',
-  TEAM_RATE_LIMIT: '90',
-  TEAM_RATE_WINDOW_SECS: '60',
-  CACHE_TTL_SECS: '21600',
-  ADMIN_PASSWORD: '',
-  MAX_PUZZLE_POINTS: '500',
-};
-
-var BACKEND_VERSION = '3.5.0';
-var BACKEND_PROTOCOL_VERSION = 2;
 
 var GAME_STEP_ACTIONS = [
   'QR_SCANNED',
@@ -114,50 +89,67 @@ var LEVEL_HEADERS = [
 ];
 
 // ============================================================================
-// CENTRALIZED SCRIPT PROPERTY LOADER (SELF-CONFIGURING WITH DEFAULTS)
+// CENTRALIZED SCRIPT PROPERTY LOADER (ZERO HARDCODED CONFIGURATION)
 // ============================================================================
 
+function getRequiredProp_(props, key) {
+  var val = String(props[key] || '').trim();
+  if (!val) {
+    throw new Error(
+      'Missing Script Property "' +
+        key +
+        '". Configure it under Project Settings → Script Properties.'
+    );
+  }
+  return val;
+}
+
+function getNumericProp_(props, key, minVal, maxVal) {
+  var raw = getRequiredProp_(props, key);
+  var num = Number(raw);
+  if (isNaN(num) || num < minVal) {
+    throw new Error('Invalid numeric Script Property "' + key + '": ' + raw);
+  }
+  var intVal = Math.floor(num);
+  return typeof maxVal === 'number' ? Math.min(maxVal, intVal) : intVal;
+}
+
 function getConfig_() {
-  var propService = PropertiesService.getScriptProperties();
-  var props = propService.getProperties();
-  var resolved = {};
-  var needsPersist = {};
-
-  for (var k in DEFAULT_PROPERTIES) {
-    var raw = String(props[k] || '').trim();
-    if (raw) {
-      resolved[k] = raw;
-    } else {
-      resolved[k] = DEFAULT_PROPERTIES[k];
-      needsPersist[k] = DEFAULT_PROPERTIES[k];
+  var props = PropertiesService.getScriptProperties().getProperties();
+  var requiredKeys = [
+    PROP_KEYS.SHEET_REG,
+    PROP_KEYS.SHEET_L1,
+    PROP_KEYS.SHEET_L2,
+    PROP_KEYS.SHEET_L3,
+    PROP_KEYS.GAME_EPOCH,
+    PROP_KEYS.TEAM_RATE_LIMIT,
+    PROP_KEYS.TEAM_RATE_WINDOW_SECS,
+    PROP_KEYS.CACHE_TTL_SECS,
+    PROP_KEYS.ADMIN_PASSWORD,
+    PROP_KEYS.MAX_PUZZLE_POINTS,
+  ];
+  var missing = [];
+  for (var i = 0; i < requiredKeys.length; i++) {
+    var k = requiredKeys[i];
+    if (!String(props[k] || '').trim()) {
+      missing.push(k);
     }
   }
-
-  var explicitId = String(
-    props[PROP_KEYS.SPREADSHEET_ID] ||
-      resolved[PROP_KEYS.SPREADSHEET_ID] ||
-      ''
-  ).trim();
-  if (!explicitId) {
-    var activeSs = SpreadsheetApp.getActiveSpreadsheet();
-    if (activeSs) {
-      explicitId = activeSs.getId();
-      needsPersist[PROP_KEYS.SPREADSHEET_ID] = explicitId;
-    }
+  var explicitId = String(props[PROP_KEYS.SPREADSHEET_ID] || '').trim();
+  if (!explicitId && !SpreadsheetApp.getActiveSpreadsheet()) {
+    missing.push(PROP_KEYS.SPREADSHEET_ID);
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      'Missing Script Properties in Project Settings → Script Properties: ' +
+        missing.join(', ')
+    );
   }
 
-  if (Object.keys(needsPersist).length > 0) {
-    try {
-      propService.setProperties(needsPersist);
-    } catch (e) {
-      // Best effort background persist
-    }
-  }
-
-  var regSheet = resolved[PROP_KEYS.SHEET_REG];
-  var l1Sheet = resolved[PROP_KEYS.SHEET_L1];
-  var l2Sheet = resolved[PROP_KEYS.SHEET_L2];
-  var l3Sheet = resolved[PROP_KEYS.SHEET_L3];
+  var regSheet = getRequiredProp_(props, PROP_KEYS.SHEET_REG);
+  var l1Sheet = getRequiredProp_(props, PROP_KEYS.SHEET_L1);
+  var l2Sheet = getRequiredProp_(props, PROP_KEYS.SHEET_L2);
+  var l3Sheet = getRequiredProp_(props, PROP_KEYS.SHEET_L3);
 
   return {
     spreadsheetId: explicitId,
@@ -172,12 +164,12 @@ function getConfig_() {
       { levelKey: 'L2', sheetName: l2Sheet },
       { levelKey: 'L3', sheetName: l3Sheet },
     ],
-    epoch: Math.max(1, parseInt(resolved[PROP_KEYS.GAME_EPOCH], 10) || 1),
-    teamRateLimit: Math.max(1, parseInt(resolved[PROP_KEYS.TEAM_RATE_LIMIT], 10) || 90),
-    teamRateWindowSecs: Math.max(1, parseInt(resolved[PROP_KEYS.TEAM_RATE_WINDOW_SECS], 10) || 60),
-    cacheTtlSecs: Math.min(21600, Math.max(30, parseInt(resolved[PROP_KEYS.CACHE_TTL_SECS], 10) || 21600)),
-    adminPassword: resolved[PROP_KEYS.ADMIN_PASSWORD],
-    maxPuzzlePoints: Math.min(100000, Math.max(1, parseInt(resolved[PROP_KEYS.MAX_PUZZLE_POINTS], 10) || 500)),
+    epoch: getNumericProp_(props, PROP_KEYS.GAME_EPOCH, 1),
+    teamRateLimit: getNumericProp_(props, PROP_KEYS.TEAM_RATE_LIMIT, 1),
+    teamRateWindowSecs: getNumericProp_(props, PROP_KEYS.TEAM_RATE_WINDOW_SECS, 1),
+    cacheTtlSecs: getNumericProp_(props, PROP_KEYS.CACHE_TTL_SECS, 30, 21600),
+    adminPassword: getRequiredProp_(props, PROP_KEYS.ADMIN_PASSWORD),
+    maxPuzzlePoints: getNumericProp_(props, PROP_KEYS.MAX_PUZZLE_POINTS, 1, 100000),
   };
 }
 
@@ -192,37 +184,6 @@ function getSpreadsheet_(cfg) {
   throw new Error(
     'Missing Script Property "SPREADSHEET_ID" and script is not bound to a Google Sheet.'
   );
-}
-
-/**
- * ONE-CLICK SETUP FUNCTION
- * Select this function in the Apps Script function dropdown and click "Run".
- * It auto-configures all Script Properties, captures the Spreadsheet ID,
- * creates and formats the 4 required tabs (Registration, L1, L2, L3),
- * and cleans up any blank default Sheet1.
- */
-function setupScriptProperties() {
-  var propService = PropertiesService.getScriptProperties();
-  var existing = propService.getProperties();
-  var toSet = {};
-
-  for (var k in DEFAULT_PROPERTIES) {
-    if (!existing[k] || !String(existing[k]).trim()) {
-      toSet[k] = DEFAULT_PROPERTIES[k];
-    }
-  }
-
-  var activeSs = SpreadsheetApp.getActiveSpreadsheet();
-  if (activeSs && (!existing[PROP_KEYS.SPREADSHEET_ID] || !String(existing[PROP_KEYS.SPREADSHEET_ID]).trim())) {
-    toSet[PROP_KEYS.SPREADSHEET_ID] = activeSs.getId();
-  }
-
-  if (Object.keys(toSet).length > 0) {
-    propService.setProperties(toSet);
-  }
-
-  initializeSpreadsheet();
-  Logger.log('✅ Pykachu Go setup complete! All properties & sheet tabs initialized.');
 }
 
 function initializeSpreadsheet() {
@@ -252,40 +213,29 @@ function constantTimeEquals_(a, b) {
 }
 
 function assertAdmin_(cfg, candidateKey) {
-  var key = String(candidateKey || '').trim();
-  if (!key) {
-    throw new Error('Unauthorized: Missing admin access key.');
-  }
-
-  // Admin access must use the explicitly configured secret. There is no fallback password.
-  var isMatch = Boolean(cfg.adminPassword) && constantTimeEquals_(key, cfg.adminPassword);
-
-  if (isMatch) {
-    // Valid password always succeeds and clears failure counter
-    try {
-      CacheService.getScriptCache().remove('admin_fail_' + cfg.epoch);
-    } catch (e) {
-      // ignore
-    }
-    return;
-  }
-
-  // Only count and lock on invalid password attempts
   var cache = CacheService.getScriptCache();
   var failKey = 'admin_fail_' + cfg.epoch;
   var rawFails = Number(cache.get(failKey) || 0) || 0;
-  var failLimit = Math.max(25, Math.floor(cfg.teamRateLimit / 2));
+  var failLimit = Math.max(5, Math.floor(cfg.teamRateLimit / 3));
   if (rawFails >= failLimit) {
-    throw new Error(
-      'Unauthorized: Admin access temporarily locked due to repeated failures.'
-    );
+    throw new Error('Unauthorized: Admin access temporarily locked due to repeated failures.');
   }
-  try {
-    cache.put(failKey, String(rawFails + 1), cfg.teamRateWindowSecs);
-  } catch (e) {
-    // ignore
+
+  if (!constantTimeEquals_(String(candidateKey || '').trim(), cfg.adminPassword)) {
+    try {
+      cache.put(failKey, String(rawFails + 1), cfg.teamRateWindowSecs);
+    } catch (e) {
+      // ignore
+    }
+    throw new Error('Unauthorized: Invalid admin access key.');
   }
-  throw new Error('Unauthorized: Invalid admin access key.');
+  if (rawFails > 0) {
+    try {
+      cache.remove(failKey);
+    } catch (e) {
+      // ignore
+    }
+  }
 }
 
 // ============================================================================
@@ -352,16 +302,6 @@ function getTeamIdentity_(data) {
   return { tid: tid, teamName: teamName };
 }
 
-function teamIdentityMatches_(row, tidIndex, teamIndex, tid, teamName) {
-  if (!row) return false;
-  var expectedTid = cellText_(tid).toUpperCase();
-  var expectedName = cellText_(teamName).toUpperCase();
-  return (
-    (!expectedTid || cellText_(row[tidIndex]).toUpperCase() === expectedTid) &&
-    (!expectedName || cellText_(row[teamIndex]).toUpperCase() === expectedName)
-  );
-}
-
 function teamRowMatches(row, tidIndex, teamIndex, tid, teamName) {
   if (!row || row.length <= Math.max(tidIndex, teamIndex)) return false;
   var tId = cellText_(tid).toUpperCase();
@@ -401,12 +341,6 @@ function ensureSheetsExist(ss, cfg, forceCheck) {
     if (!sheet) {
       sheet = ss.insertSheet(t.name);
     }
-    if (sheet.getMaxColumns() < t.headers.length) {
-      sheet.insertColumnsAfter(
-        sheet.getMaxColumns(),
-        t.headers.length - sheet.getMaxColumns()
-      );
-    }
     if (sheet.getLastRow() <= 0) {
       var headerRange = sheet.getRange(1, 1, 1, t.headers.length);
       headerRange.setValues([t.headers]);
@@ -420,19 +354,6 @@ function ensureSheetsExist(ss, cfg, forceCheck) {
       );
     }
   });
-
-  // Remove empty default 'Sheet1' if our configured tabs are ready
-  try {
-    var defaultSheet =
-      ss.getSheetByName('Sheet1') ||
-      ss.getSheetByName('Feuille 1') ||
-      ss.getSheetByName('Hoja 1');
-    if (defaultSheet && defaultSheet.getLastRow() <= 1 && ss.getSheets().length > 1) {
-      ss.deleteSheet(defaultSheet);
-    }
-  } catch (e) {
-    // Non-fatal if default sheet cannot be deleted
-  }
 
   try {
     cache.put(readyKey, '1', cfg.cacheTtlSecs);
@@ -576,19 +497,7 @@ function getRegisteredInfo_(ss, tid, teamName, cfg) {
   var cached = cache.get(rKey);
   if (cached) {
     try {
-      var cachedInfo = JSON.parse(cached);
-      var cachedSheet = ss.getSheetByName(cfg.sheets.reg);
-      if (
-        cachedSheet &&
-        cachedInfo.row > 1 &&
-        cachedInfo.row <= cachedSheet.getLastRow()
-      ) {
-        var cachedRow = cachedSheet
-          .getRange(cachedInfo.row, 1, 1, REG_HEADERS.length)
-          .getValues()[0];
-        if (teamIdentityMatches_(cachedRow, 1, 2, tid, teamName)) return cachedInfo;
-        if (teamRowMatches(cachedRow, 1, 2, tid, teamName)) return { invalid: true };
-      }
+      return JSON.parse(cached);
     } catch (e) {
       // fall through
     }
@@ -601,7 +510,6 @@ function getRegisteredInfo_(ss, tid, teamName, cfg) {
     .getValues();
   for (var i = 1; i < rows.length; i++) {
     if (teamRowMatches(rows[i], 1, 2, tid, teamName)) {
-      if (!teamIdentityMatches_(rows[i], 1, 2, tid, teamName)) return { invalid: true };
       var info = { row: i + 1, sessionId: cellText_(rows[i][6]) };
       try {
         cache.put(rKey, JSON.stringify(info), cfg.cacheTtlSecs);
@@ -790,28 +698,12 @@ function doGet(e) {
   try {
     var cfg = getConfig_();
     var params = (e && e.parameter) || {};
-
-    // Direct browser hit / health check probe (no query action)
-    if (!params.action) {
-      return jsonResponse_({
-        status: 'success',
-        message: 'Pykachu Go Apps Script Backend is live and healthy!',
-        epoch: cfg.epoch,
-        version: BACKEND_VERSION,
-        protocolVersion: BACKEND_PROTOCOL_VERSION,
-        spreadsheetId: cfg.spreadsheetId
-          ? cfg.spreadsheetId.substring(0, 8) + '...'
-          : 'active',
-      });
-    }
-
-    var action = String(params.action).trim().toUpperCase();
+    var action = String(params.action || 'ADMIN_GET_DATA').trim().toUpperCase();
 
     if (action === 'GET_EPOCH' || action === 'GETMETA') {
       return jsonResponse_({
         status: 'success',
         epoch: cfg.epoch,
-        protocolVersion: BACKEND_PROTOCOL_VERSION,
       });
     }
 
@@ -825,7 +717,6 @@ function doGet(e) {
       return jsonResponse_({
         status: 'success',
         epoch: cfg.epoch,
-        protocolVersion: BACKEND_PROTOCOL_VERSION,
         solved: ctx.solved.slice(),
         unlocked: ctx.solved.slice(),
         hintsUsed: ctx.hintsUsed || [],
@@ -872,20 +763,12 @@ function doPost(e) {
     var action = String(data.action).trim().toUpperCase();
 
     if (action === 'GET_EPOCH') {
-      return jsonResponse_({
-        status: 'success',
-        epoch: cfg.epoch,
-        protocolVersion: BACKEND_PROTOCOL_VERSION,
-      });
+      return jsonResponse_({ status: 'success', epoch: cfg.epoch });
     }
 
     if (action === 'ADMIN_AUTH') {
       assertAdmin_(cfg, data.adminKey || data.password);
-      return jsonResponse_({
-        status: 'success',
-        session: 'admin-verified',
-        protocolVersion: BACKEND_PROTOCOL_VERSION,
-      });
+      return jsonResponse_({ status: 'success', session: 'admin-verified' });
     }
 
     if (action === 'ADMIN_GET_DATA') {
@@ -930,11 +813,7 @@ function doPost(e) {
       );
       invalidateAdminSnapshotCache_(cfg);
       SpreadsheetApp.flush();
-      return jsonResponse_({
-        status: 'success',
-        epoch: nextEpoch,
-        protocolVersion: BACKEND_PROTOCOL_VERSION,
-      });
+      return jsonResponse_({ status: 'success', epoch: nextEpoch });
     }
 
     var ss = getSpreadsheet_(cfg);
@@ -949,7 +828,6 @@ function doPost(e) {
       return jsonResponse_({
         status: 'success',
         epoch: cfg.epoch,
-        protocolVersion: BACKEND_PROTOCOL_VERSION,
         solved: ctx.solved.slice(),
         unlocked: ctx.solved.slice(),
         hintsUsed: ctx.hintsUsed || [],
@@ -972,10 +850,6 @@ function doPost(e) {
       return jsonResponse_({ status: 'error', message: 'login required' });
     }
 
-    if (!String(data.sessionId || '').trim()) {
-      return jsonResponse_({ status: 'error', message: 'sessionId is required' });
-    }
-
     var rateKey = writeSession.tid || writeSession.teamName || '';
     if (!checkTeamRate(rateKey, cfg)) {
       return jsonResponse_({
@@ -988,23 +862,6 @@ function doPost(e) {
     var mutated = false;
 
     if (action === 'SESSION_BATCH' && Array.isArray(data.events)) {
-      if (data.events.length < 1 || data.events.length > 25) {
-        return jsonResponse_({ status: 'error', message: 'Batch must contain 1 to 25 events' });
-      }
-      var seenBatchIds = {};
-      for (var v = 0; v < data.events.length; v++) {
-        var candidateEvent = data.events[v];
-        var candidateId = String(candidateEvent && candidateEvent.eventId || '').trim();
-        if (
-          !candidateEvent ||
-          !candidateId ||
-          seenBatchIds[candidateId] ||
-          !String(candidateEvent.sessionId || data.sessionId || '').trim()
-        ) {
-          return jsonResponse_({ status: 'error', message: 'Every batch event needs a unique eventId' });
-        }
-        seenBatchIds[candidateId] = true;
-      }
       // Process REGISTRATION events first so session binding succeeds cleanly
       var orderedEvents = [];
       for (var r = 0; r < data.events.length; r++) {
@@ -1020,33 +877,16 @@ function doPost(e) {
         }
       }
 
-      var acceptedEventIds = [];
-      var rejectedEvents = [];
       for (var k = 0; k < orderedEvents.length; k++) {
         var ev = orderedEvents[k];
         ev.tid = writeSession.tid || sanitizeId_(String(ev.tid || '').toUpperCase(), 32);
         ev.teamName = writeSession.teamName || String(ev.teamName || '').trim().substring(0, 60);
         if (!ev.sessionId && data.sessionId) ev.sessionId = data.sessionId;
-        var outcome = processEventFast_(ss, ev, cfg);
-        var eventId = String(ev.eventId || '').trim();
-        if (outcome === true || isDuplicateEvent(eventId, cfg)) {
-          acceptedEventIds.push(eventId);
-        } else {
-          rejectedEvents.push({
-            eventId: eventId,
-            reason: outcome === 'rejected_auth'
-              ? 'Team session not registered or does not match'
-              : 'Event was invalid or could not be applied',
-          });
-        }
-        if (outcome === true) {
+        if (processEventFast_(ss, ev, cfg)) {
           mutated = true;
         }
       }
     } else {
-      if (action === 'SESSION_BATCH') {
-        return jsonResponse_({ status: 'error', message: 'Batch events are required' });
-      }
       data.tid = writeSession.tid;
       data.teamName = writeSession.teamName;
       var outcome = processEventFast_(ss, data, cfg);
@@ -1063,20 +903,7 @@ function doPost(e) {
       invalidateAdminSnapshotCache_(cfg);
       SpreadsheetApp.flush();
     }
-    if (action === 'SESSION_BATCH') {
-      return jsonResponse_({
-        status: 'success',
-        epoch: cfg.epoch,
-        protocolVersion: BACKEND_PROTOCOL_VERSION,
-        acceptedEventIds: acceptedEventIds,
-        rejectedEvents: rejectedEvents,
-      });
-    }
-    return jsonResponse_({
-      status: 'success',
-      epoch: cfg.epoch,
-      protocolVersion: BACKEND_PROTOCOL_VERSION,
-    });
+    return jsonResponse_({ status: 'success', epoch: cfg.epoch });
   } catch (err) {
     return jsonResponse_({
       status: 'error',
@@ -1136,9 +963,7 @@ function processEventFast_(ss, data, cfg) {
 
   // ── 1. REGISTRATION: Direct O(1) row update/append + session bind ──────────
   if (action === 'REGISTRATION') {
-    if (!incomingSession) return 'rejected_auth';
     var regInfo = getRegisteredInfo_(ss, tid, teamName, cfg);
-    if (regInfo && regInfo.invalid) return 'rejected_auth';
     var levelVal = safeCell(
       String(
         data.level ||
@@ -1152,7 +977,7 @@ function processEventFast_(ss, data, cfg) {
       var existing = sheet
         .getRange(regInfo.row, 1, 1, REG_HEADERS.length)
         .getValues()[0];
-      if (teamIdentityMatches_(existing, 1, 2, tid, teamName)) {
+      if (teamRowMatches(existing, 1, 2, tid, teamName)) {
         regRowIdx = regInfo.row;
         rowArray = [
           existing[0] || timestamp,
@@ -1187,13 +1012,13 @@ function processEventFast_(ss, data, cfg) {
 
   // ── 2. LEVEL EVENTS: Enforce session binding & O(1) targeted row upsert ──
   var regCheck = getRegisteredInfo_(ss, tid, teamName, cfg);
-  if (!regCheck || regCheck.invalid) {
+  if (!regCheck) {
     // Reject unauthenticated writes from unregistered teams
     return 'rejected_auth';
   }
   if (
-    !incomingSession ||
-    !regCheck.sessionId ||
+    regCheck.sessionId &&
+    incomingSession &&
     regCheck.sessionId !== incomingSession
   ) {
     // Reject stale / hijacked session writes
@@ -1387,10 +1212,6 @@ function writeSingleRow_(sheet, rowIdx, rowData) {
   if (rowIdx > maxRows) {
     sheet.insertRowsAfter(maxRows, rowIdx - maxRows);
   }
-  var maxCols = sheet.getMaxColumns();
-  if (rowData.length > maxCols) {
-    sheet.insertColumnsAfter(maxCols, rowData.length - maxCols);
-  }
   sheet.getRange(rowIdx, 1, 1, rowData.length).setValues([rowData]);
 }
 
@@ -1401,12 +1222,7 @@ function writeSingleRow_(sheet, rowIdx, rowData) {
 function getAdminData_(cfg) {
   var cacheKey = adminSnapshotCacheKey_(cfg);
   var cached = cacheGetJson_(cacheKey);
-  if (
-    cached &&
-    cached.epoch === cfg.epoch &&
-    cached.protocolVersion === BACKEND_PROTOCOL_VERSION &&
-    Array.isArray(cached.logs)
-  ) {
+  if (cached && cached.epoch === cfg.epoch && Array.isArray(cached.logs)) {
     return cached;
   }
 
@@ -1473,8 +1289,6 @@ function getAdminData_(cfg) {
   var payload = {
     status: 'success',
     epoch: cfg.epoch,
-    version: BACKEND_VERSION,
-    protocolVersion: BACKEND_PROTOCOL_VERSION,
     logs: list,
   };
   var snapshotTtl = Math.min(

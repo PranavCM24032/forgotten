@@ -2,7 +2,11 @@ node_modules/
 build/
 dist/
 coverage/
+.vercel
+.aistudio/
 .DS_Store
+Thumbs.db
 *.log
+npm-debug.log*
 .env*
 !.env.example
