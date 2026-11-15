@@ -254,7 +254,12 @@ async function postWithOutbox(
   }
 
   try {
-    await callAppsScriptPost(payload, timeoutMs);
+    const response = await callAppsScriptPost(payload, timeoutMs);
+    if (Number(response.protocolVersion || 0) < 2) {
+      throw new Error(
+        'Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
+      );
+    }
     if (eventId) removeSyncEvents(new Set([eventId]));
     // Trigger background drain if older retries are waiting
     if (readPendingSyncQueue().length > 0) {
@@ -310,6 +315,11 @@ export async function flushPendingSyncQueue(): Promise<void> {
             },
             15000
           );
+          if (Number(response.protocolVersion || 0) < 2) {
+            throw new Error(
+              'Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
+            );
+          }
           const acceptedIds = Array.isArray(response.acceptedEventIds)
             ? response.acceptedEventIds.map(String)
             : [];
@@ -355,8 +365,9 @@ export async function flushPendingSyncQueue(): Promise<void> {
             // unresolved events remain in the outbox for a later retry.
             return;
           }
-        } catch {
-          // Stop batching on transient error; items stay safely in outbox
+        } catch (err) {
+          // Stop batching on transient error; items stay safely in outbox.
+          console.warn('[Sheets] Batch sync failed; events remain queued:', err);
           return;
         }
       }
@@ -781,6 +792,14 @@ export async function fetchGameMeta(): Promise<{
     try {
       const remote = await callAppsScriptGet('GET_EPOCH', {}, 3500);
       const remoteEpoch = Array.isArray(remote) ? 1 : Number(remote?.epoch || 1);
+      const protocolVersion = Array.isArray(remote)
+        ? 0
+        : Number(remote.protocolVersion || 0);
+      if (protocolVersion < 2) {
+        console.error(
+          '[Sheets] Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
+        );
+      }
       return {
         epoch: Math.max(localEpoch, Number.isFinite(remoteEpoch) && remoteEpoch >= 1 ? Math.floor(remoteEpoch) : 1),
         catalogVersion: localOverrides.catalogVersion,
@@ -927,6 +946,7 @@ export interface RememberedTeamInfo {
   tid: string;
   mission: string;
   language: LanguageCode;
+  sessionId?: string;
 }
 
 export interface SavedGameState {
@@ -1774,6 +1794,11 @@ export async function fetchAdminLogs(
         { adminKey: adminKey || undefined },
         20000
       );
+      if (!Array.isArray(res) && Number(res.protocolVersion || 0) < 2) {
+        throw new Error(
+          'Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
+        );
+      }
       const rawRows = Array.isArray(res)
         ? res
         : Array.isArray(res.logs)
@@ -1795,20 +1820,9 @@ export async function fetchAdminLogs(
       };
     } catch (err) {
       console.warn('[Admin Telemetry] Google Apps Script sync error:', err);
-      if (err instanceof Error && /unauthorized/i.test(err.message)) {
-        throw err;
-      }
-      const allLogs = readLocalTelemetryLogs();
-      if (allLogs.length === 0) {
-        // No local fallback available; propagate error so Admin Dashboard shows offline/error state
-        throw err;
-      }
-      return {
-        epoch: localEpoch,
-        logs: allLogs,
-        nextSinceRow: allLogs.length + 2,
-        fullSnapshot: true,
-      };
+      // Do not present this browser's local events as if they came from the shared sheet.
+      // Local-only telemetry is returned only when no Apps Script backend is configured.
+      throw err;
     }
   }
 
@@ -1826,18 +1840,20 @@ export async function adminResetAllData(adminKey: string): Promise<number> {
   let nextEpoch = Math.min(1000000, curEpoch + 1);
 
   if (hasAppsScriptBackend()) {
-    try {
-      const res = await callAppsScriptPost({
-        action: 'RESET_ALL',
-        adminKey: adminKey || undefined,
-      });
-      const remoteEpoch = Number(res?.epoch || 0);
-      if (Number.isFinite(remoteEpoch) && remoteEpoch > 0) {
-        nextEpoch = Math.max(nextEpoch, Math.floor(remoteEpoch));
-      }
-    } catch {
-      // keep local epoch bump even if remote offline
+    const res = await callAppsScriptPost({
+      action: 'RESET_ALL',
+      adminKey: adminKey || undefined,
+    });
+    if (Number(res.protocolVersion || 0) < 2) {
+      throw new Error(
+        'Apps Script deployment is outdated; deploy apps-script/Code.gs v3.5.0.'
+      );
     }
+    const remoteEpoch = Number(res?.epoch || 0);
+    if (!Number.isFinite(remoteEpoch) || remoteEpoch < 1) {
+      throw new Error('Apps Script reset did not return a valid epoch.');
+    }
+    nextEpoch = Math.max(nextEpoch, Math.floor(remoteEpoch));
   }
 
   wipeAllLocalGameStorage(nextEpoch);

@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * PYKACHU GO v3.4 — HARDENED GOOGLE APPS SCRIPT TELEMETRY BACKEND
+ * PYKACHU GO v3.5 — HARDENED GOOGLE APPS SCRIPT TELEMETRY BACKEND
  * ============================================================================
  * Architecture:
  *   - Local JSON (`public/data/*.json`) serves static catalog & admin login.
@@ -17,7 +17,7 @@
  *      All 4 tabs (Registration, L1, L2, L3) will be created and formatted instantly!
  *   5. Click Deploy → New deployment:
  *      - Select type: Web app (gear icon)
- *      - Description: Pykachu Go v3.4 Telemetry
+ *      - Description: Pykachu Go v3.5 Telemetry
  *      - Execute as: Me (<your-email>)
  *      - Who has access: Anyone
  *   6. Click Deploy, copy the Web App URL (ends with /exec), and paste into your project's .env:
@@ -66,6 +66,9 @@ var DEFAULT_PROPERTIES = {
   ADMIN_PASSWORD: '',
   MAX_PUZZLE_POINTS: '500',
 };
+
+var BACKEND_VERSION = '3.5.0';
+var BACKEND_PROTOCOL_VERSION = 2;
 
 var GAME_STEP_ACTIONS = [
   'QR_SCANNED',
@@ -794,7 +797,8 @@ function doGet(e) {
         status: 'success',
         message: 'Pykachu Go Apps Script Backend is live and healthy!',
         epoch: cfg.epoch,
-        version: '3.4',
+        version: BACKEND_VERSION,
+        protocolVersion: BACKEND_PROTOCOL_VERSION,
         spreadsheetId: cfg.spreadsheetId
           ? cfg.spreadsheetId.substring(0, 8) + '...'
           : 'active',
@@ -807,6 +811,7 @@ function doGet(e) {
       return jsonResponse_({
         status: 'success',
         epoch: cfg.epoch,
+        protocolVersion: BACKEND_PROTOCOL_VERSION,
       });
     }
 
@@ -820,6 +825,7 @@ function doGet(e) {
       return jsonResponse_({
         status: 'success',
         epoch: cfg.epoch,
+        protocolVersion: BACKEND_PROTOCOL_VERSION,
         solved: ctx.solved.slice(),
         unlocked: ctx.solved.slice(),
         hintsUsed: ctx.hintsUsed || [],
@@ -866,12 +872,20 @@ function doPost(e) {
     var action = String(data.action).trim().toUpperCase();
 
     if (action === 'GET_EPOCH') {
-      return jsonResponse_({ status: 'success', epoch: cfg.epoch });
+      return jsonResponse_({
+        status: 'success',
+        epoch: cfg.epoch,
+        protocolVersion: BACKEND_PROTOCOL_VERSION,
+      });
     }
 
     if (action === 'ADMIN_AUTH') {
       assertAdmin_(cfg, data.adminKey || data.password);
-      return jsonResponse_({ status: 'success', session: 'admin-verified' });
+      return jsonResponse_({
+        status: 'success',
+        session: 'admin-verified',
+        protocolVersion: BACKEND_PROTOCOL_VERSION,
+      });
     }
 
     if (action === 'ADMIN_GET_DATA') {
@@ -916,7 +930,11 @@ function doPost(e) {
       );
       invalidateAdminSnapshotCache_(cfg);
       SpreadsheetApp.flush();
-      return jsonResponse_({ status: 'success', epoch: nextEpoch });
+      return jsonResponse_({
+        status: 'success',
+        epoch: nextEpoch,
+        protocolVersion: BACKEND_PROTOCOL_VERSION,
+      });
     }
 
     var ss = getSpreadsheet_(cfg);
@@ -931,6 +949,7 @@ function doPost(e) {
       return jsonResponse_({
         status: 'success',
         epoch: cfg.epoch,
+        protocolVersion: BACKEND_PROTOCOL_VERSION,
         solved: ctx.solved.slice(),
         unlocked: ctx.solved.slice(),
         hintsUsed: ctx.hintsUsed || [],
@@ -1048,11 +1067,16 @@ function doPost(e) {
       return jsonResponse_({
         status: 'success',
         epoch: cfg.epoch,
+        protocolVersion: BACKEND_PROTOCOL_VERSION,
         acceptedEventIds: acceptedEventIds,
         rejectedEvents: rejectedEvents,
       });
     }
-    return jsonResponse_({ status: 'success', epoch: cfg.epoch });
+    return jsonResponse_({
+      status: 'success',
+      epoch: cfg.epoch,
+      protocolVersion: BACKEND_PROTOCOL_VERSION,
+    });
   } catch (err) {
     return jsonResponse_({
       status: 'error',
@@ -1377,7 +1401,12 @@ function writeSingleRow_(sheet, rowIdx, rowData) {
 function getAdminData_(cfg) {
   var cacheKey = adminSnapshotCacheKey_(cfg);
   var cached = cacheGetJson_(cacheKey);
-  if (cached && cached.epoch === cfg.epoch && Array.isArray(cached.logs)) {
+  if (
+    cached &&
+    cached.epoch === cfg.epoch &&
+    cached.protocolVersion === BACKEND_PROTOCOL_VERSION &&
+    Array.isArray(cached.logs)
+  ) {
     return cached;
   }
 
@@ -1444,6 +1473,8 @@ function getAdminData_(cfg) {
   var payload = {
     status: 'success',
     epoch: cfg.epoch,
+    version: BACKEND_VERSION,
+    protocolVersion: BACKEND_PROTOCOL_VERSION,
     logs: list,
   };
   var snapshotTtl = Math.min(

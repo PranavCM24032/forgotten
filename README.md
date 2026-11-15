@@ -47,6 +47,8 @@ The app starts on `http://localhost:3000`.
    - `SPREADSHEET_ID` (required only if Apps Script is standalone; optional if opened from Extensions → Apps Script)
 3. Run `initializeSpreadsheet` once, then **Deploy → Web app** (`Execute as: Me`, `Who has access: Anyone`).
 4. Copy `.env.example` to `.env` and set `VITE_APPS_SCRIPT_URL="<your-web-app-/exec-url>"`.
+5. After changing `apps-script/Code.gs`, use **Deploy → Manage deployments → Edit** on the existing web app and select **New version**. Keep the same deployment URL; the app now requires backend protocol version 2 (health version `3.5.0`).
+6. For Vercel, add `VITE_APPS_SCRIPT_URL` under **Project Settings → Environment Variables** for each environment you deploy, then redeploy the frontend. A local `.env` file does not configure Vercel builds.
 
 ### 3. Build & Verify
 ```bash
