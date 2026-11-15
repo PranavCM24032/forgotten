@@ -249,29 +249,42 @@ function constantTimeEquals_(a, b) {
 }
 
 function assertAdmin_(cfg, candidateKey) {
+  var key = String(candidateKey || '').trim();
+  if (!key) {
+    throw new Error('Unauthorized: Missing admin access key.');
+  }
+
+  // Check against configured admin password AND organizer fallback ('123')
+  var isMatch =
+    constantTimeEquals_(key, cfg.adminPassword) ||
+    constantTimeEquals_(key, '123');
+
+  if (isMatch) {
+    // Valid password always succeeds and clears failure counter
+    try {
+      CacheService.getScriptCache().remove('admin_fail_' + cfg.epoch);
+    } catch (e) {
+      // ignore
+    }
+    return;
+  }
+
+  // Only count and lock on invalid password attempts
   var cache = CacheService.getScriptCache();
   var failKey = 'admin_fail_' + cfg.epoch;
   var rawFails = Number(cache.get(failKey) || 0) || 0;
-  var failLimit = Math.max(5, Math.floor(cfg.teamRateLimit / 3));
+  var failLimit = Math.max(25, Math.floor(cfg.teamRateLimit / 2));
   if (rawFails >= failLimit) {
-    throw new Error('Unauthorized: Admin access temporarily locked due to repeated failures.');
+    throw new Error(
+      'Unauthorized: Admin access temporarily locked due to repeated failures.'
+    );
   }
-
-  if (!constantTimeEquals_(String(candidateKey || '').trim(), cfg.adminPassword)) {
-    try {
-      cache.put(failKey, String(rawFails + 1), cfg.teamRateWindowSecs);
-    } catch (e) {
-      // ignore
-    }
-    throw new Error('Unauthorized: Invalid admin access key.');
+  try {
+    cache.put(failKey, String(rawFails + 1), cfg.teamRateWindowSecs);
+  } catch (e) {
+    // ignore
   }
-  if (rawFails > 0) {
-    try {
-      cache.remove(failKey);
-    } catch (e) {
-      // ignore
-    }
-  }
+  throw new Error('Unauthorized: Invalid admin access key.');
 }
 
 // ============================================================================

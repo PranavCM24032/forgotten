@@ -23,11 +23,16 @@ export function hasAppsScriptBackend(): boolean {
 }
 
 function getAppsScriptUrl(): string {
-  const url = String(import.meta.env.VITE_APPS_SCRIPT_URL || '').trim();
+  let url = String(import.meta.env.VITE_APPS_SCRIPT_URL || '').trim();
   if (!url) {
     throw new Error(
       'Apps Script URL not configured (operating in fast local JSON mode).'
     );
+  }
+  // Strip Google Workspace tenant prefix (/a/macros/<domain>/s/ -> /macros/s/)
+  // Institutional /a/ paths fail CORS and force Google login redirects.
+  if (url.includes('/a/macros/')) {
+    url = url.replace(/\/a\/macros\/[^/]+\/s\//, '/macros/s/');
   }
   return url;
 }
@@ -1705,10 +1710,21 @@ export async function fetchAdminLogs(
         fullSnapshot: true,
       };
     } catch (err) {
+      console.warn('[Admin Telemetry] Google Apps Script sync error:', err);
       if (err instanceof Error && /unauthorized/i.test(err.message)) {
         throw err;
       }
-      // fall back cleanly to local telemetry logs on network / offline issues
+      const allLogs = readLocalTelemetryLogs();
+      if (allLogs.length === 0) {
+        // No local fallback available; propagate error so Admin Dashboard shows offline/error state
+        throw err;
+      }
+      return {
+        epoch: localEpoch,
+        logs: allLogs,
+        nextSinceRow: allLogs.length + 2,
+        fullSnapshot: true,
+      };
     }
   }
 
