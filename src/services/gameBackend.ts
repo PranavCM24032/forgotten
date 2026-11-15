@@ -68,7 +68,7 @@ function unwrapAppsScriptPayload(raw: unknown, label: string): Record<string, un
 async function callAppsScriptGet(
   action: string,
   params: Record<string, string | number | boolean | undefined> = {},
-  timeoutMs = 8000
+  timeoutMs = 12000
 ): Promise<Record<string, unknown> | unknown[]> {
   const baseUrl = getAppsScriptUrl();
   const url = new URL(baseUrl);
@@ -101,7 +101,7 @@ async function callAppsScriptGet(
 
 async function callAppsScriptPost(
   body: Record<string, unknown>,
-  timeoutMs = 8000
+  timeoutMs = 12000
 ): Promise<Record<string, unknown>> {
   const baseUrl = getAppsScriptUrl();
   const action = String(body.action || 'UNKNOWN');
@@ -1400,7 +1400,7 @@ export async function syncTeamRegistrationToDb(params: {
         sessionId: sessionId.trim().slice(0, 64),
         timestamp: nowIso,
       },
-      3500
+      12000
     );
   }
 
@@ -1682,6 +1682,8 @@ export async function fetchAdminLogs(
   nextSinceRow: number;
   fullSnapshot: boolean;
 }> {
+  const localEpoch = Math.max(1, Number(localStorage.getItem(STORAGE_KEYS.gameEpoch) || 1));
+
   if (hasAppsScriptBackend()) {
     try {
       const res = await callAppsScriptGet(
@@ -1689,7 +1691,6 @@ export async function fetchAdminLogs(
         { adminKey: adminKey || undefined },
         20000
       );
-      const localEpoch = Math.max(1, Number(localStorage.getItem(STORAGE_KEYS.gameEpoch) || 1));
       const rawRows = Array.isArray(res)
         ? res
         : Array.isArray(res.logs)
@@ -1728,7 +1729,6 @@ export async function fetchAdminLogs(
     }
   }
 
-  const localEpoch = Math.max(1, Number(localStorage.getItem(STORAGE_KEYS.gameEpoch) || 1));
   const allLogs = readLocalTelemetryLogs();
   return {
     epoch: localEpoch,
